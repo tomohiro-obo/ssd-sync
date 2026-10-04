@@ -1,5 +1,15 @@
 # Ubuntu 26.04 2台SSD 待機系運用 手順書（LVM + スナップショット同期）
 
+## 同梱ファイル
+
+| ファイル | 配置先 | 役割 |
+|---|---|---|
+| `ssd-sync.sh` | `/usr/local/sbin/ssd-sync` | メインからサブへ、起動できる状態を保ったまま同期する |
+| `ssd-role-indicator` | `/usr/local/bin/ssd-role-indicator` | サブで起動したときに、壁紙を警告用に切り替える |
+| `ssd-role-indicator.desktop` | `/etc/xdg/autostart/` | ログイン時に `ssd-role-indicator` を自動起動する |
+
+---
+
 ## 0. 概要
 
 ### 0-1. 構成と運用
@@ -9,20 +19,33 @@
 - 各 SSD は、それぞれ独立に Ubuntu をインストールしておく。
 
 ```
-[スロット] SSD-A（メイン）              [USBケース] SSD-B（サブ）※バックアップ時のみ接続
-├─ p1  ESP    /boot/efi  vfat           ├─ p1  ESP
-├─ p2  /boot             ext4           ├─ p2  /boot
-└─ p3  PV ── VG vg_ssd_a                └─ p3  PV ── VG vg_ssd_b
-             ├─ LV root  ext4 /                      ├─ LV root
-             └─ VFree（スナップショット用）             └─ VFree
+  [Internal slot]                        [USB enclosure] (backup only)
+  SSD-A : main                           SSD-B : standby
+  |                                      |
+  +-- p1  ESP    /boot/efi  vfat         +-- p1  ESP    /boot/efi  vfat
+  +-- p2  /boot             ext4         +-- p2  /boot             ext4
+  `-- p3  PV                             `-- p3  PV
+          `-- VG vg_ssd_a                        `-- VG vg_ssd_b
+              +-- LV root   ext4  /                  +-- LV root   ext4  /
+              `-- VFree (snapshot)                   `-- VFree (snapshot)
 ```
 
 バックアップの流れ（`sudo ssd-sync vg_ssd_b`）:
 
 ```
-A: LV root ─スナップショット(ro)─rsync─▶ B: LV root
-A: /boot   ─────────────────rsync─▶ B: /boot  （grub.cfg は除外）
-B に chroot: grub-install → update-initramfs → update-grub   ※B の UUID と VG 名で再生成
+  SSD-A (running)                                     SSD-B (USB)
+
+  +---------+  lvcreate -s  +-----------+   rsync     +---------+
+  | LV root | ------------> | root_snap | ----------> | LV root |
+  +---------+               |   (ro)    |             +---------+
+                            +-----------+
+  +---------+                  rsync                  +---------+
+  |  /boot  | ------------------------------------->  |  /boot  |
+  +---------+       (grub.cfg, grubenv excluded)      +---------+
+
+  chroot into SSD-B:
+      grub-install --no-nvram -> update-initramfs -> update-grub
+      (regenerated with SSD-B's own UUIDs and VG name)
 ```
 
 ### 0-2. LVM 用語
@@ -36,10 +59,17 @@ B に chroot: grub-install → update-initramfs → update-grub   ※B の UUID 
 
 ### 0-3. ルール
 
-1. **VG 名はディスクごとに変える**（`vg_ssd_a`, `vg_ssd_b`, 交換後は `vg_ssd_c` …）。バックアップ時は2台が同時に見えるので、名前が同じだと衝突する。
-2. **`dd` でクローンしない。** UUID が重複するため。
-3. **fstab・ESP・grub.cfg は同期しない**（ディスク固有の情報を含むため）。`/etc/fstab` を変更したときは両方に手で反映する。
-4. サブは「待機系」であり、バックアップではない。誤って削除したものも同期で伝搬するので、重要なデータは restic / borg などで別の媒体に世代管理つきで保存する。
+> [!IMPORTANT]
+> **VG 名はディスクごとに変えてください**（`vg_ssd_a`, `vg_ssd_b`, 交換後は `vg_ssd_c` …）。バックアップ時は2台が同時に見えるので、名前が同じだと衝突します。
+
+> [!CAUTION]
+> **`dd` でクローンしないでください。** UUID が重複し、どちらのディスクから起動したのか区別できなくなります。
+
+> [!NOTE]
+> **fstab・ESP・grub.cfg は同期しません**（ディスク固有の情報を含むため）。`/etc/fstab` を変更したときは、両方のディスクに手で反映してください。
+
+> [!WARNING]
+> サブは「待機系」であり、バックアップではありません。誤って削除したファイルも同期で伝搬します。重要なデータは restic / borg などで、別の媒体に世代管理つきで保存してください。
 
 ---
 
@@ -47,7 +77,8 @@ B に chroot: grub-install → update-initramfs → update-grub   ※B の UUID 
 
 ### 1-1. 現状確認
 
-VM で試す場合は、先に VM のスナップショットを取っておきます。
+> [!TIP]
+> VM で試す場合は、先に VM のスナップショットを取っておくと、いつでもやり直せます。
 
 ```bash
 sudo vgs; sudo lvs
@@ -65,12 +96,14 @@ ls -l /dev/mapper/                 # vg_ssd_a-root があること
 sudo update-initramfs -u -k all
 ```
 
-> この時点では `sudo update-grub` は失敗します（`failed to get canonical path of /dev/mapper/ubuntu--vg-ubuntu--lv`）。`/` のマウント情報に旧名が再起動まで残るためです。grub.cfg は旧名のままなので、次の再起動では手で新しい名前を指定します。
+> [!WARNING]
+> この時点では `sudo update-grub` は失敗します（`failed to get canonical path of /dev/mapper/ubuntu--vg-ubuntu--lv`）。`/` のマウント情報に、旧名が再起動まで残るためです。
+> grub.cfg は旧名のままなので、**そのまま再起動すると起動できません。** 1-3 の手順で、新しい名前を手で指定して起動してください。
 
 ### 1-3. GRUB で新しい名前を指定して起動し、grub.cfg を再生成する
 
-1. `sudo reboot` を実行し、起動直後に `Esc` を押して GRUB メニューを出します（押しすぎると `grub>` プロンプトに落ちるので数回だけ）。
-2. 先頭のエントリで `e` を押し、`linux` 行の `root=/dev/mapper/ubuntu--vg-ubuntu--lv` を `root=/dev/mapper/vg_ssd_a-root` に書き換えて `Ctrl-X` で起動します。
+1. `sudo reboot` を実行し、起動直後に `Esc` を押して GRUB メニューを出します。
+2. 先頭のエントリで `e` を押し、`linux` 行の `root=/dev/mapper/ubuntu--vg-ubuntu--lv` を `root=/dev/mapper/vg_ssd_a-root` に書き換えて、`Ctrl-X` で起動します。
 3. 起動したら grub.cfg を再生成します。
 
 ```bash
@@ -80,7 +113,11 @@ grep -m2 'root=' /boot/grub/grub.cfg    # root=/dev/mapper/vg_ssd_a-root
 sudo reboot                             # 手を加えずに起動できることを確認
 ```
 
-`(initramfs)` のプロンプトで止まった場合は、`lvm vgchange -ay` → `exit` で起動し、1-3 をやり直します。
+> [!TIP]
+> `Esc` を押しすぎると `grub>` プロンプトに落ちます。押すのは数回だけにしてください。
+
+> [!NOTE]
+> `(initramfs)` のプロンプトで止まった場合は、`lvm vgchange -ay` → `exit` で起動し、1-3 をやり直してください。
 
 ### 1-4. スナップショット用の VFree を確保する
 
@@ -88,8 +125,10 @@ sudo reboot                             # 手を加えずに起動できるこ�
 sudo vgs vg_ssd_a        # VFree を確認
 ```
 
-- **目安**: バックアップ中にメインへ書き込まれる量より大きいこと。10〜20G あれば通常は足ります（スクリプトの既定値は 10G）。
-- VFree が 0 の場合は、次の手順で root LV を縮小します。VM ならディスクを拡張して `growpart /dev/vda 3` → `pvresize /dev/vda3` でも作れます。
+**目安**: バックアップ中にメインへ書き込まれる量より大きいこと。10〜20G あれば通常は足ります（スクリプトの既定値は 10G）。VFree が 0 の場合は、次の手順で root LV を縮小します。
+
+> [!TIP]
+> VM の場合は、仮想ディスクを拡張してから `growpart /dev/vda 3` → `pvresize /dev/vda3` を実行すれば、縮小せずに VFree を作れます。
 
 **(1) 通常起動の状態で、縮小後のサイズを決める**
 
@@ -98,7 +137,10 @@ df -h /                                   # 使用量
 sudo lvs -o lv_name,lv_size vg_ssd_a      # 現在の LV サイズ
 ```
 
-縮小後のサイズは「使用量＋十分な余裕」にします。A と B で同じ値にするので、メモしておきます。重要なデータは事前に別の媒体へ退避しておいてください。
+縮小後のサイズは「使用量＋十分な余裕」にします。A と B で同じ値にするので、メモしておきます。
+
+> [!WARNING]
+> 縮小は、失敗するとファイルシステムが壊れる操作です。重要なデータは事前に別の媒体へ退避しておいてください。
 
 **(2) Live USB（Try Ubuntu）で縮小する**
 
@@ -116,32 +158,37 @@ vgchange -an vg_ssd_a
 poweroff
 ```
 
-- **`-r` は必須です。** ext4 → LV の順で縮小されます。付けずに実行すると、ファイルシステムが壊れます。
-- 途中で中断したり、電源を切ったりしないでください。
+> [!CAUTION]
+> **`-r` は必須です。** `-r` を付けると、ext4 → LV の順で縮小されます。付けずに実行すると、ファイルシステムの末尾が切り落とされて壊れます。
+> 処理の途中で中断したり、電源を切ったりしないでください。
 
 **(3) SSD から起動して確認する**
 
 1. Live USB を抜いて電源を入れ、SSD から通常どおり起動します。
 2. 起動したディスクと LV のサイズを確認します。
    ```bash
-   findmnt -no SOURCE /                        # /dev/mapper/vg_ssd_a-root
-   df -h /                                     # Size が縮小後のサイズになっていること
-   sudo lvs -o lv_name,lv_size vg_ssd_a        # root が縮小後のサイズ
+   findmnt -no SOURCE /                         # /dev/mapper/vg_ssd_a-root
+   df -h /                                      # Size が縮小後のサイズになっていること
+   sudo lvs -o lv_name,lv_size vg_ssd_a         # root が縮小後のサイズ
    sudo vgs -o vg_name,vg_size,vg_free vg_ssd_a # VFree が増えていること
    ```
 3. スナップショットを実際に作成・削除できるか試します。
    ```bash
    sudo lvcreate -s -L 10G -n root_snap vg_ssd_a/root
-   sudo lvs vg_ssd_a                           # root_snap が表示され、Data% が小さい値
+   sudo lvs vg_ssd_a                            # root_snap が表示され、Data% が小さい値
    sudo lvremove -y vg_ssd_a/root_snap
-   sudo vgs vg_ssd_a                           # VFree が元の値に戻っていること
+   sudo vgs vg_ssd_a                            # VFree が元の値に戻っていること
    ```
 
-UUID は変わらないので、fstab や GRUB の修正は不要です。
+> [!NOTE]
+> UUID は変わらないので、fstab や GRUB の修正は不要です。
 
 ---
 
 ## 2. サブSSD（SSD-B）の初期設定
+
+> [!IMPORTANT]
+> インストールは、**SSD-B だけをスロットに入れた状態**で行ってください。インストーラが SSD-A に触れないようにするためです。
 
 1. スロットから SSD-A を外し、SSD-B を入れます。
 2. Ubuntu 26.04 をインストールします。
@@ -152,12 +199,12 @@ UUID は変わらないので、fstab や GRUB の修正は不要です。
    sudo vgrename ubuntu-vg vg_ssd_b
    sudo lvrename vg_ssd_b ubuntu-lv root
    sudo update-initramfs -u -k all
-   # → GRUB で root=/dev/mapper/vg_ssd_b-root を指定して起動 → sudo update-grub
+   # -> GRUB で root=/dev/mapper/vg_ssd_b-root を指定して起動 -> sudo update-grub
    ```
 4. root LV のサイズを A と同じにそろえます（SSD-B で起動した状態で）。
    ```bash
    sudo lvs -o lv_name,lv_size --units g vg_ssd_b     # 例: root 15.00g
-   sudo vgs -o vg_name,vg_free --units g vg_ssd_b      # VFree
+   sudo vgs -o vg_name,vg_free --units g vg_ssd_b     # VFree
    ```
    - B の root が A より**小さい**場合は、拡張します（オンラインでできます）。
      ```bash
@@ -173,28 +220,29 @@ UUID は変わらないので、fstab や GRUB の修正は不要です。
    sudo vgs                                 # 2つの VG が別名で見えること
    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS    # sdX の各パーティションがマウントされていないこと
    ```
-   問題がなければ、3（スクリプトの配置）と 4（初回バックアップ）に進みます。初回のバックアップ後は、必ず 4-3 の起動確認をしてください。
+   問題がなければ、3（スクリプトの配置）と 4（初回バックアップ）に進みます。
 
 ---
 
 ## 3. バックアップ用の準備（メインで1回だけ）
 
 ```bash
-# スクリプトを配置する
+# 同期スクリプトを配置する
 sudo install -m 0755 ssd-sync.sh /usr/local/sbin/ssd-sync
 
 # （推奨）USB を接続したときの自動マウントを無効にする（デスクトップのユーザーで実行）
 gsettings set org.gnome.desktop.media-handling automount false
 ```
 
-自動マウントが有効なままだと、USB を接続した時点でサブの /boot や ESP が `/media/...` にマウントされます。この場合スクリプトは安全のため中止し、`udisksctl unmount -b <デバイス>` の実行を促します。
+> [!NOTE]
+> 自動マウントが有効なままだと、USB を接続した時点でサブの /boot や ESP が `/media/...` にマウントされます。この場合スクリプトは安全のため中止し、`udisksctl unmount -b <デバイス>` の実行を促します。
 
 ### 3-1. メインの登録とサブ起動時の警告壁紙
 
 どちらがメインかを `/etc/ssd-sync/main-vg` に書いておきます。このファイルは同期でサブにもコピーされるので、サブで起動すると「自分の VG ≠ メイン」と判定されます。
 
 - **ログイン時の動作**：サブで起動していれば、警告用の壁紙（赤いストライプ、VG 名、最終同期日時）に切り替わり、通知も表示されます。メインで起動していれば何もしません。
-- **`ssd-sync` の動作**：サブから起動した状態で誤って同期すると、古いサブの内容でメインを上書きしてしまいます。これを防ぐため、`-f` を付けない限り中止します。
+- **`ssd-sync` の動作**：サブから起動した状態で同期しようとすると、`-f` を付けない限り中止します。
 
 ```bash
 # メインの VG を登録する
@@ -210,10 +258,10 @@ ssd-role-indicator --as sub     # 警告壁紙に変わる
 ssd-role-indicator --as main    # 元の壁紙に戻る
 ```
 
-これらのファイルは root ファイルシステム上にあるので、次の同期でサブにも配置されます。サブ側で個別に作業する必要はありません。
-
-- 壁紙の設定はユーザーの dconf に保存され、これもメインから同期されます。そのため、サブで警告壁紙に変わっても、次の同期でメインの設定に上書きされます。
-- 警告壁紙は `~/.local/state/ssd-role-indicator/` に生成されます。
+> [!NOTE]
+> - これらのファイルは root ファイルシステム上にあるので、次の同期でサブにも配置されます。サブ側で個別に作業する必要はありません。
+> - 壁紙の設定はユーザーの dconf に保存され、これもメインから同期されます。サブで警告壁紙に変わっても、次の同期でメインの設定に上書きされます。
+> - 警告壁紙は `~/.local/state/ssd-role-indicator/` に生成されます。
 
 ---
 
@@ -232,7 +280,7 @@ ssd-role-indicator --as main    # 元の壁紙に戻る
 sudo vgs                                  # vg_ssd_a と vg_ssd_b が表示される
 lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS     # サブのパーティションがマウントされていないこと
 
-# 2) ドライラン（差分の確認のみ）→ 本番
+# 2) ドライラン（差分の確認のみ）-> 本番
 sudo ssd-sync -n vg_ssd_b
 sudo ssd-sync vg_ssd_b                    # 書き込みが多いときは -s 20G
 
@@ -244,14 +292,20 @@ udisksctl power-off -b /dev/sdX           # sdX はサブのディスク（lsblk
 - 失敗した場合も、スナップショットの削除とアンマウントは自動で行われます。
 - 同期元は、今起動している VG から自動で判定されます。役割が入れ替わった後も、同期先の VG 名を指定するだけで使えます。
 
+> [!WARNING]
+> 「完了」以外（WARNING や異常終了）で終わった場合は、USB を外す前にログを確認してください。非活性化に失敗した場合は、再起動してから取り外します。
+
 ### 4-3. 起動確認（初回と、カーネル更新後の同期のあと）
 
-サブから実際に起動できるかを確認します。次のどちらかの方法で行います。
+> [!IMPORTANT]
+> サブが実際に起動できるかは、起動してみないと分かりません。初回の同期後と、カーネルや GRUB を更新したあとの同期後は、必ず確認してください。
+
+次のどちらかの方法で、サブから起動します。
 
 - **USB ケースのまま起動する**：ファームウェアのブートメニュー（F12 など）から USB ディスクを選びます。root を LV 名で指定しているので、USB 接続でも起動できます。ファームウェアで USB 起動が有効になっている必要があります。
 - **スロットに差し替えて起動する**。
 
-起動したら確認します。
+起動したら確認します（警告壁紙が表示されるはずです）。
 
 ```bash
 findmnt -no SOURCE /                 # /dev/mapper/vg_ssd_b-root
@@ -272,29 +326,50 @@ cat /var/lib/ssd-sync/last-sync      # 最終同期日時
 
 ## 6. 故障時の手順
 
+役割は次のように移っていきます。
+
+```
+  Normal          [slot] SSD-A (main)       [USB] SSD-B (standby)
+                       |
+  SSD-A fails          v
+  Promote B       [slot] SSD-B (main)       main-vg := vg_ssd_b
+                       |
+  New SSD              v
+  Add C           [slot] SSD-B (main)       [USB] SSD-C (standby, vg_ssd_c)
+```
+
 ### 6-1. メインSSD（A）が故障した場合
 
 1. 電源を切り、SSD-A を外して、**SSD-B をスロットに入れます**。
-2. 起動します。UEFI の起動エントリは A を指したままですが、各 ESP にあるフォールバック用のブートローダ（`\EFI\BOOT\BOOTX64.EFI`）で通常は自動的に起動します。起動しない場合は、ファームウェアのブートメニューで SSD を選んでください。
+2. 起動します。UEFI の起動エントリは A を指したままですが、各 ESP にあるフォールバック用のブートローダ（`\EFI\BOOT\BOOTX64.EFI`）で、通常は自動的に起動します。起動しない場合は、ファームウェアのブートメニューで SSD を選んでください。
 3. 確認します。
    ```bash
    findmnt -no SOURCE /                 # vg_ssd_b-root
    cat /var/lib/ssd-sync/last-sync      # どの時点の状態か
    ```
-4. **B をメインとして登録します。** 登録するまでは、警告壁紙が表示され続け、`ssd-sync` も実行できません。
+4. B をメインとして登録します。
    ```bash
    echo vg_ssd_b | sudo tee /etc/ssd-sync/main-vg
    ssd-role-indicator              # 元の壁紙に戻る（次回ログイン時にも自動で戻る）
    ```
 5. 以後は B がメインです。
 
+> [!IMPORTANT]
+> `main-vg` を更新するまでは、警告壁紙が表示され続け、`ssd-sync` も実行できません。
+
 ### 6-2. 新しい SSD（C）をサブとして組み込む
 
-1. 電源を切り、SSD-B を外して、**新しい SSD をスロットに入れます**。インストーラが B に触れないようにするためです。
-2. 2 と同じ手順でインストールし、VG 名を **`vg_ssd_c`** にします（名前は再利用しない）。root LV のサイズと VFree は B と同じにします。
+> [!IMPORTANT]
+> 新しい SSD へのインストールは、**その SSD だけをスロットに入れた状態**で行ってください。インストーラが現メイン（B）に触れないようにするためです。
+
+1. 電源を切り、SSD-B を外して、新しい SSD をスロットに入れます。
+2. 2 と同じ手順でインストールし、VG 名を **`vg_ssd_c`** にします。root LV のサイズと VFree は B と同じにします。
 3. SSD-B をスロットに戻し、SSD-C は USB ケースに入れます。
 4. B から起動します。起動しない場合は、ファームウェアのブートメニューで SSD を選んでください。
 5. `sudo ssd-sync -n vg_ssd_c` → `sudo ssd-sync vg_ssd_c` を実行し、4-3 で C から起動できるか確認します。
+
+> [!TIP]
+> VG 名は再利用せず、新しい名前を付けてください。故障した A が何かの拍子に接続されても、名前が衝突しません。
 
 ### 6-3. サブSSDが故障した場合
 
@@ -302,14 +377,18 @@ cat /var/lib/ssd-sync/last-sync      # 最終同期日時
 
 ### 6-4. メインは壊れていないが、アップデート失敗などで起動しない場合
 
-- **起動できない状態のメインからは同期しないでください。** 壊れた状態がサブに伝搬します。
-- サブから（USB ケースのまま、または差し替えて）起動し、調査します。
-- サブの状態でメインを書き戻す場合は、サブから起動した状態でメインを接続し、逆方向に同期します。この場合、A の root は B の状態で上書きされます。A に残っている必要なデータは、先に退避してください。
-  逆方向の同期では `-f` が必要です（`main-vg` は vg_ssd_a のままでかまいません）。
-  ```bash
-  sudo ssd-sync -n -f vg_ssd_a
-  sudo ssd-sync -f vg_ssd_a
-  ```
+> [!CAUTION]
+> **起動できない状態のメインからは同期しないでください。** 壊れた状態がサブに伝搬します。
+
+1. サブから（USB ケースのまま、または差し替えて）起動し、調査します。
+2. サブの状態でメインを書き戻す場合は、サブから起動した状態でメインを接続し、逆方向に同期します。逆方向の同期では `-f` が必要です（`main-vg` は vg_ssd_a のままでかまいません）。
+   ```bash
+   sudo ssd-sync -n -f vg_ssd_a
+   sudo ssd-sync -f vg_ssd_a
+   ```
+
+> [!WARNING]
+> 逆方向に同期すると、A の root は B の状態で上書きされます。A に残っている必要なデータは、先に退避してください。
 
 ---
 
