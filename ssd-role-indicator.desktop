@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SSD Role Indicator
+Comment=Switch the wallpaper to a warning when booted from the standby SSD
+Exec=/usr/local/bin/ssd-role-indicator
+OnlyShowIn=GNOME;
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

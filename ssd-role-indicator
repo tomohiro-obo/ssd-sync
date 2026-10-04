@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# =============================================================================
+# @file    ssd-role-indicator
+# @brief   サブ (待機系) SSD で起動したときに、デスクトップの壁紙を警告用に切り替える
+#
+# @details
+#   GNOME セッション開始時に自動起動 (/etc/xdg/autostart) で実行される。
+#
+#   判定方法:
+#     - 現在の "/" が載っている VG 名を /dev/mapper の名前から求める
+#     - /etc/ssd-sync/main-vg に書かれた VG 名 (= 現在のメイン) と比較する
+#       このファイルは ssd-sync でサブにもそのまま同期されるため、
+#       サブで起動すると「自分 != メイン」となって警告モードになる
+#
+#   壁紙の設定はユーザーの dconf (~/.config/dconf/user) に保存され、
+#   これもメインからサブへ同期される。そのため:
+#     - サブで起動した場合: 現在の壁紙設定を退避し、警告壁紙 (SVG) に切り替える
+#     - メインで起動した場合: 警告壁紙になっていれば退避した設定に戻す
+#       (サブがメインへ昇格したときなど。通常は何もしない)
+#
+#   警告壁紙には VG 名と最終同期日時 (/var/lib/ssd-sync/last-sync) を描画する。
+#
+# @usage   ssd-role-indicator                 自動判定 (autostart から実行)
+#          ssd-role-indicator --as sub        動作確認用: サブとして振る舞う
+#          ssd-role-indicator --as main       動作確認用: メインとして振る舞う (壁紙を戻す)
+#
+# @retval  0  成功 (判定できない場合も何もせず 0)
+# @retval  1  引数エラー
+# =============================================================================
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# 設定値
+# -----------------------------------------------------------------------------
+readonly main_vg_file="/etc/ssd-sync/main-vg"
+readonly stamp_file="/var/lib/ssd-sync/last-sync"
+readonly schema="org.gnome.desktop.background"
+readonly -a bg_keys=(picture-uri picture-uri-dark picture-options)
+readonly state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/ssd-role-indicator"
+readonly orig_file="${state_dir}/original-background"   # 退避した壁紙設定
+readonly svg_prefix="standby-wallpaper-"                # 生成する警告壁紙のファイル名接頭辞
+
+##
+# @brief  現在の "/" が載っている VG 名を返す
+# @details
+#   /dev/mapper/<VG>-<LV> の形式から VG 名を取り出す。device-mapper の名前では
+#   VG/LV 名の中の "-" が "--" にエスケープされるため、それを考慮して分割する。
+#   lvs は一般ユーザーでは実行できないため使わない。
+# @return 標準出力に VG 名。LVM でなければ 1 を返す
+##
+current_vg() {
+    local root_dev name tmp vg
+    root_dev="$(findmnt -no SOURCE /)"
+    [[ "${root_dev}" == /dev/mapper/* ]] || return 1
+    name="${root_dev#/dev/mapper/}"
+    tmp="${name//--/$'\x01'}"          # エスケープされた "-" を一時的に退避
+    vg="${tmp%%-*}"                    # 最初の単独 "-" より前が VG 名
+    printf '%s\n' "${vg//$'\x01'/-}"
+}
+
+##
+# @brief  XML (SVG) 用に文字列をエスケープする
+# @param  $1 文字列
+##
+xml_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    printf '%s' "${s}"
+}
+
+##
+# @brief  警告壁紙 (SVG) を生成し、そのパスを返す
+# @param  $1 現在の VG 名
+# @param  $2 メインの VG 名
+# @details
+#   内容 (VG 名・最終同期日時) が変わったときに GNOME が確実に再読込するよう、
+#   内容のハッシュをファイル名に含める。古いファイルは削除する。
+# @return 標準出力に SVG ファイルのパス
+##
+make_wallpaper() {
+    local vg="$1" main_vg="$2"
+    local synced="不明" svg hash path
+
+    if [[ -r "${stamp_file}" ]]; then
+        synced="$(sed -n 's/^synced_at=//p' "${stamp_file}" | sed 's/T/ /; s/+.*//')"
+        [[ -n "${synced}" ]] || synced="不明"
+    fi
+    vg="$(xml_escape "${vg}")"
+    main_vg="$(xml_escape "${main_vg}")"
+    synced="$(xml_escape "${synced}")"
+
+    # 1920x1080 基準。preserveAspectRatio=slice で任意の解像度に拡大・切り取り
+    svg="$(cat <<EOF
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <pattern id="stripe" width="80" height="80" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="80" height="80" fill="#7a1010"/>
+      <rect width="40" height="80" fill="#8f1a1a"/>
+    </pattern>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#stripe)"/>
+  <rect x="260" y="300" width="1400" height="480" rx="24" fill="#000" fill-opacity="0.55"/>
+  <g font-family="Noto Sans CJK JP, Noto Sans, sans-serif" text-anchor="middle" fill="#fff">
+    <text x="960" y="420" font-size="88" font-weight="bold" fill="#ffd400">サブ SSD で起動中</text>
+    <text x="960" y="520" font-size="44">この環境: ${vg}　/　メイン: ${main_vg}</text>
+    <text x="960" y="600" font-size="44">最終同期: ${synced}</text>
+    <text x="960" y="700" font-size="32" fill="#ddd">ここでの変更はメインに反映されず、次回の同期で上書きされます</text>
+  </g>
+</svg>
+EOF
+)"
+    hash="$(printf '%s' "${svg}" | md5sum | cut -c1-12)"
+    path="${state_dir}/${svg_prefix}${hash}.svg"
+
+    mkdir -p "${state_dir}"
+    if [[ ! -f "${path}" ]]; then
+        find "${state_dir}" -maxdepth 1 -name "${svg_prefix}*.svg" -delete
+        printf '%s\n' "${svg}" > "${path}"
+    fi
+    printf '%s\n' "${path}"
+}
+
+##
+# @brief  現在の壁紙が、本スクリプトが設定した警告壁紙かどうか
+##
+is_warning_wallpaper() {
+    [[ "$(gsettings get "${schema}" picture-uri)" == *"/${svg_prefix}"* ]]
+}
+
+##
+# @brief  サブとして動作: 壁紙設定を退避し、警告壁紙に切り替える
+# @param  $1 現在の VG 名
+# @param  $2 メインの VG 名
+##
+apply_sub() {
+    local vg="$1" main_vg="$2"
+    local key path uri
+
+    mkdir -p "${state_dir}"
+    # 既に警告壁紙なら退避しない (退避済みの元設定を上書きしないため)
+    if ! is_warning_wallpaper; then
+        for key in "${bg_keys[@]}"; do
+            printf '%s=%s\n' "${key}" "$(gsettings get "${schema}" "${key}")"
+        done > "${orig_file}"
+    fi
+
+    path="$(make_wallpaper "${vg}" "${main_vg}")"
+    uri="file://${path}"
+    gsettings set "${schema}" picture-options "'zoom'"
+    gsettings set "${schema}" picture-uri "'${uri}'"
+    gsettings set "${schema}" picture-uri-dark "'${uri}'"
+
+    # 通知でも知らせる (notify-send が無い環境では無視)
+    if command -v notify-send >/dev/null; then
+        notify-send -u critical "サブ SSD で起動しています" \
+            "この環境: ${vg} / メイン: ${main_vg}" || true
+    fi
+}
+
+##
+# @brief  メインとして動作: 警告壁紙になっていれば元の設定に戻す
+##
+apply_main() {
+    local line key value
+    is_warning_wallpaper || return 0
+    if [[ -r "${orig_file}" ]]; then
+        while IFS= read -r line; do
+            key="${line%%=*}"
+            value="${line#*=}"
+            # 値は gsettings get の出力 (GVariant テキスト表現) なのでそのまま渡せる
+            gsettings set "${schema}" "${key}" "${value}"
+        done < "${orig_file}"
+        rm -f "${orig_file}"
+    else
+        # 退避情報が無い場合は既定値に戻す
+        for key in "${bg_keys[@]}"; do
+            gsettings reset "${schema}" "${key}"
+        done
+    fi
+}
+
+##
+# @brief  エントリポイント
+# @param  $@ コマンドライン引数
+##
+main() {
+    local mode="" vg main_vg
+
+    case "${1:-}" in
+        "")   ;;
+        --as)
+            [[ "${2:-}" == "sub" || "${2:-}" == "main" ]] || { echo "Usage: ${0##*/} [--as sub|main]" >&2; exit 1; }
+            mode="$2" ;;
+        *)    echo "Usage: ${0##*/} [--as sub|main]" >&2; exit 1 ;;
+    esac
+
+    # メインの定義が無い、または LVM でなければ何もしない
+    [[ -r "${main_vg_file}" ]] || exit 0
+    main_vg="$(tr -d '[:space:]' < "${main_vg_file}")"
+    [[ -n "${main_vg}" ]] || exit 0
+    vg="$(current_vg)" || exit 0
+
+    if [[ -z "${mode}" ]]; then
+        if [[ "${vg}" == "${main_vg}" ]]; then
+            mode="main"
+        else
+            mode="sub"
+        fi
+    fi
+
+    if [[ "${mode}" == "sub" ]]; then
+        apply_sub "${vg}" "${main_vg}"
+    else
+        apply_main
+    fi
+}
+
+main "$@"
